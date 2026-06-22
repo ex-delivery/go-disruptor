@@ -11,21 +11,16 @@ import (
 	"github.com/ex-delivery/go-disruptor"
 )
 
-type Event struct{ Value int64 }
-
-func newEvent() Event { return Event{} }
-
 // TestSPSC verifies a single producer / single consumer carries every event.
 func TestSPSC(t *testing.T) {
 	const N = 1 << 16
 	d := disruptor.NewDisruptor(1024, newEvent)
 
 	var sum int64 // single consumer goroutine; read after Stop (happens-before)
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -44,8 +39,7 @@ func TestSPSC(t *testing.T) {
 }
 
 // TestMPSC verifies many producers / single consumer: every sequence is
-// delivered exactly once AND each slot carries the correct payload (a slot race
-// would corrupt the checksum).
+// delivered exactly once AND each slot carries the correct payload.
 func TestMPSC(t *testing.T) {
 	const producers = 4
 	const perProd = 1 << 14
@@ -54,11 +48,10 @@ func TestMPSC(t *testing.T) {
 	d := disruptor.NewDisruptor(1024, newEvent, disruptor.WithProducerFunc(disruptor.NewMultiProducer))
 
 	var sum int64 // single consumer; read after Stop
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -81,18 +74,16 @@ func TestMPSC(t *testing.T) {
 	}
 }
 
-// TestRingWrap hammers a tiny ring so sequences lap many times, stressing the
-// version-number (lap) gating.
+// TestRingWrap hammers a tiny ring so sequences lap many times.
 func TestRingWrap(t *testing.T) {
 	const N = 1000
 	d := disruptor.NewDisruptor(8, newEvent) // capacity 8 -> ~125 laps
 
 	var sum int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -111,36 +102,30 @@ func TestRingWrap(t *testing.T) {
 }
 
 // TestDiamondDependencies verifies a fan-out/fan-in DAG: b and c run in parallel,
-// merge depends on both. merge must never observe a sequence before both b and c
-// have processed it.
+// merge depends on both and must never see a sequence before both have it.
 func TestDiamondDependencies(t *testing.T) {
 	const N = 1 << 14
 	d := disruptor.NewDisruptor(1024, newEvent)
 
 	bSeen := make([]int32, N)
 	cSeen := make([]int32, N)
-	var mergeCount int64
-	var violations int64
+	var mergeCount, violations int64
 
-	b := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			atomic.StoreInt32(&bSeen[buf[s&mask].Value], 1)
+	b := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		atomic.StoreInt32(&bSeen[e.Value], 1)
+		return nil
+	}))
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		atomic.StoreInt32(&cSeen[e.Value], 1)
+		return nil
+	}))
+	merge := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		if atomic.LoadInt32(&bSeen[e.Value]) != 1 || atomic.LoadInt32(&cSeen[e.Value]) != 1 {
+			atomic.AddInt64(&violations, 1)
 		}
-	})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			atomic.StoreInt32(&cSeen[buf[s&mask].Value], 1)
-		}
-	})
-	merge := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			v := buf[s&mask].Value
-			if atomic.LoadInt32(&bSeen[v]) != 1 || atomic.LoadInt32(&cSeen[v]) != 1 {
-				atomic.AddInt64(&violations, 1)
-			}
-			atomic.AddInt64(&mergeCount, 1)
-		}
-	}).Depends(b, c)
+		atomic.AddInt64(&mergeCount, 1)
+		return nil
+	})).Depends(b, c)
 
 	d.RegisterConsumer(b, c, merge)
 	d.Start()
@@ -160,18 +145,16 @@ func TestDiamondDependencies(t *testing.T) {
 	}
 }
 
-// TestGracefulDrain publishes a burst then stops immediately; every published
-// event must still be processed.
+// TestGracefulDrain publishes a burst then stops; every event must be processed.
 func TestGracefulDrain(t *testing.T) {
 	const N = 5000
 	d := disruptor.NewDisruptor(1024, newEvent)
 
 	var count int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			count += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		count += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -190,21 +173,20 @@ func TestGracefulDrain(t *testing.T) {
 }
 
 // TestBackpressureBlocksProducer parks the consumer and checks the producer
-// cannot publish more than the ring holds. NOTE: timing-based (uses a sleep);
-// run with -race and on a loaded machine it is generally stable but not a strict
-// guarantee.
+// cannot publish more than the ring holds.
 func TestBackpressureBlocksProducer(t *testing.T) {
 	const capacity = 4
 	const total = capacity + 3
 
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
-	proceed := make(chan struct{}) // closed to release the consumer
+	proceed := make(chan struct{})
 	var consumed int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
 		<-proceed // park until released; after close, returns immediately
-		atomic.AddInt64(&consumed, hi-lo+1)
-	})
+		atomic.AddInt64(&consumed, 1)
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -220,8 +202,6 @@ func TestBackpressureBlocksProducer(t *testing.T) {
 		}
 	}()
 
-	// The ring holds `capacity` events and the consumer is parked, so the
-	// producer must block before publishing all `total` events.
 	time.Sleep(50 * time.Millisecond)
 	if got := atomic.LoadInt64(&published); got >= total {
 		t.Fatalf("producer published %d/%d with consumer parked (no back-pressure)", got, total)
@@ -230,12 +210,8 @@ func TestBackpressureBlocksProducer(t *testing.T) {
 		t.Fatalf("producer published %d, exceeds ring capacity %d", got, capacity)
 	}
 
-	close(proceed) // release consumer; the blocked producer can now finish
-	// The Disruptor contract requires every producer to have stopped publishing
-	// before Stop. Join the producer goroutine first, otherwise Stop may snapshot
-	// a partial writer cursor and alert the consumer before the late publishes are
-	// drained (a flaky consumed/published < total).
-	<-prodDone
+	close(proceed)
+	<-prodDone // contract: producers stopped before Stop
 	d.Stop()
 
 	if got := atomic.LoadInt64(&published); got != total {
@@ -246,24 +222,21 @@ func TestBackpressureBlocksProducer(t *testing.T) {
 	}
 }
 
-// TestOnPanicContinues verifies a panicking handler is recovered and the
-// pipeline keeps draining the rest.
-func TestOnPanicContinues(t *testing.T) {
+// TestExceptionHandlerContinues verifies a panicking handler is routed to the
+// ExceptionHandler and the pipeline keeps draining the rest.
+func TestExceptionHandlerContinues(t *testing.T) {
 	const N = 100
 	d := disruptor.NewDisruptor(64, newEvent)
 
 	var processed int64
-	var panics int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			if buf[s&mask].Value == 50 {
-				panic("boom")
-			}
-			atomic.AddInt64(&processed, 1)
+	exc := &countingExceptions{}
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		if e.Value == 50 {
+			panic("boom")
 		}
-	}).OnPanic(func(any, int64, int64) {
-		atomic.AddInt64(&panics, 1)
-	})
+		atomic.AddInt64(&processed, 1)
+		return nil
+	})).HandleExceptionsWith(exc)
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -274,12 +247,11 @@ func TestOnPanicContinues(t *testing.T) {
 	}
 	d.Stop()
 
-	if panics == 0 {
-		t.Fatalf("expected the handler to panic at least once")
+	if exc.events.Load() == 0 {
+		t.Fatal("expected the handler panic to reach the ExceptionHandler")
 	}
-	// Everything except the single poisoned batch should have been processed.
 	if processed == 0 || processed >= N {
-		t.Fatalf("processed=%d, expected to skip the poisoned batch but keep going", processed)
+		t.Fatalf("processed=%d, expected to skip the poisoned event but keep going", processed)
 	}
 }
 
@@ -288,11 +260,10 @@ func ExampleDisruptor() {
 
 	d := disruptor.NewDisruptor(1024, func() Order { return Order{} })
 	var total int64
-	c := d.Consumer(func(buf []Order, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			total += buf[s&mask].ID
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Order](func(e *Order, seq int64, eob bool) error {
+		total += e.ID
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -307,20 +278,19 @@ func ExampleDisruptor() {
 	// Output: 6
 }
 
-// TestTryNextRespectsCapacity parks the consumer, then claims with the
-// non-blocking TryNext. Exactly `capacity` claims must succeed (the consumer's
-// read cursor stays put while it is parked), and the next claim must fail
-// instead of blocking.
+// TestTryNextRespectsCapacity: with a parked consumer, exactly capacity claims
+// succeed, then TryNext fails instead of blocking.
 func TestTryNextRespectsCapacity(t *testing.T) {
 	const capacity = 8
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
-	proceed := make(chan struct{}) // closed to release the parked consumer
+	proceed := make(chan struct{})
 	var consumed int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
 		<-proceed
-		atomic.AddInt64(&consumed, hi-lo+1)
-	})
+		atomic.AddInt64(&consumed, 1)
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -328,36 +298,36 @@ func TestTryNextRespectsCapacity(t *testing.T) {
 	for {
 		seq, ok := d.TryNext(1)
 		if !ok {
-			break // ring full — expected once `capacity` slots are in flight
+			break
 		}
 		d.Get(seq).Value = 1
 		d.Publish(seq, seq)
 		claimed++
 		if claimed > capacity {
-			t.Fatalf("TryNext kept succeeding past capacity %d (no back-pressure)", capacity)
+			t.Fatalf("TryNext kept succeeding past capacity %d", capacity)
 		}
 	}
 	if claimed != capacity {
 		t.Fatalf("claimed=%d before TryNext failed, want=%d", claimed, capacity)
 	}
 
-	close(proceed) // release the consumer so the pipeline drains
+	close(proceed)
 	d.Stop()
 	if consumed != capacity {
 		t.Fatalf("consumed=%d want=%d", consumed, capacity)
 	}
 }
 
-// TestRemainingCapacity checks the free-slot count tracks publishing and
-// recovers to full once the ring has drained.
+// TestRemainingCapacity tracks free slots through publishing and draining.
 func TestRemainingCapacity(t *testing.T) {
 	const capacity = 8
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
 	proceed := make(chan struct{})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
 		<-proceed
-	})
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -380,9 +350,7 @@ func TestRemainingCapacity(t *testing.T) {
 	}
 }
 
-// TestTryNextMultiProducer drives many concurrent producers through TryNext,
-// retrying on a full ring, and verifies every sequence still lands exactly once
-// with the correct payload.
+// TestTryNextMultiProducer drives many concurrent producers through TryNext.
 func TestTryNextMultiProducer(t *testing.T) {
 	const producers = 4
 	const perProd = 1 << 12
@@ -391,11 +359,10 @@ func TestTryNextMultiProducer(t *testing.T) {
 	d := disruptor.NewDisruptor(1024, newEvent, disruptor.WithProducerFunc(disruptor.NewMultiProducer))
 
 	var sum int64 // single consumer; read after Stop
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -406,10 +373,10 @@ func TestTryNextMultiProducer(t *testing.T) {
 				for {
 					seq, ok := d.TryNext(1)
 					if !ok {
-						runtime.Gosched() // ring full; let the consumer drain
+						runtime.Gosched()
 						continue
 					}
-					d.Get(seq).Value = seq + 1 // payload derived from the sequence
+					d.Get(seq).Value = seq + 1
 					d.Publish(seq, seq)
 					break
 				}
@@ -419,7 +386,7 @@ func TestTryNextMultiProducer(t *testing.T) {
 	wg.Wait()
 	d.Stop()
 
-	want := int64(total) * (int64(total) + 1) / 2 // sum of 1..total
+	want := int64(total) * (int64(total) + 1) / 2
 	if sum != want {
 		t.Fatalf("checksum=%d want=%d (lost, duplicated, or corrupted events)", sum, want)
 	}

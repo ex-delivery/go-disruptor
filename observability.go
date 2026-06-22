@@ -7,12 +7,11 @@ import "time"
 // — and safe to call concurrently. Intended for periodic scraping by a metrics
 // collector (Prometheus, expvar, logs, ...).
 type Stats struct {
-	Published     int64   // total events published so far (writer cursor + 1)
-	Capacity      int64   // ring size
-	Free          int64   // currently free slots; 0 means the producer is back-pressured
-	Backpressure  int64   // cumulative producer claims that had to wait for room
-	ConsumerLag   []int64 // per registered consumer: published events not yet processed
-	WorkerPoolLag []int64 // per registered worker pool: events not yet finished
+	Published    int64   // total events published so far (writer cursor + 1)
+	Capacity     int64   // ring size
+	Free         int64   // currently free slots; 0 means the producer is back-pressured
+	Backpressure int64   // cumulative producer claims that had to wait for room
+	ConsumerLag  []int64 // per registered consumer: published events not yet processed
 }
 
 // Stats returns a snapshot of the disruptor's health. Call it from a metrics
@@ -27,9 +26,6 @@ func (d *Disruptor[T]) Stats() Stats {
 	}
 	for _, c := range d.consumers {
 		s.ConsumerLag = append(s.ConsumerLag, c.Lag())
-	}
-	for _, p := range d.pools {
-		s.WorkerPoolLag = append(s.WorkerPoolLag, p.Lag())
 	}
 	return s
 }

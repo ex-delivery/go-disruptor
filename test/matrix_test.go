@@ -7,18 +7,17 @@ import (
 )
 
 // TestBatchPublish exercises multi-slot claims: Next(n>1) reserves a contiguous
-// range that is filled and published in one Publish(lo, hi).
+// range filled and published in one Publish(lo, hi).
 func TestBatchPublish(t *testing.T) {
 	const N = 1 << 12
 	const batch = 7
 	d := disruptor.NewDisruptor(1024, newEvent)
 
 	var sum int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -42,8 +41,7 @@ func TestBatchPublish(t *testing.T) {
 	}
 }
 
-// TestWaitStrategies runs an SPSC round under each wait strategy to confirm they
-// all carry every event (only the default was previously exercised).
+// TestWaitStrategies runs an SPSC round under each wait strategy.
 func TestWaitStrategies(t *testing.T) {
 	strategies := map[string]disruptor.WaitStrategy{
 		"busyspin": disruptor.BusySpinWait{},
@@ -55,11 +53,10 @@ func TestWaitStrategies(t *testing.T) {
 			const N = 1 << 12
 			d := disruptor.NewDisruptor(256, newEvent, disruptor.WithWaitStrategy(ws))
 			var sum int64
-			c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-				for s := lo; s <= hi; s++ {
-					sum += buf[s&mask].Value
-				}
-			})
+			c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+				sum += e.Value
+				return nil
+			}))
 			d.RegisterConsumer(c)
 			d.Start()
 
@@ -78,8 +75,7 @@ func TestWaitStrategies(t *testing.T) {
 	}
 }
 
-// TestCapacityRounding checks NewDisruptor rounds the capacity up to a power of
-// two (minimum 1).
+// TestCapacityRounding checks NewDisruptor rounds capacity up to a power of two.
 func TestCapacityRounding(t *testing.T) {
 	cases := map[int64]int64{1: 1, 2: 2, 3: 4, 100: 128, 1000: 1024, 1024: 1024}
 	for in, want := range cases {
@@ -90,11 +86,12 @@ func TestCapacityRounding(t *testing.T) {
 	}
 }
 
-// TestClaimCountGuard checks that a non-positive claim count is treated as one
-// slot, consistently across Next and TryNext.
+// TestClaimCountGuard checks a non-positive claim count is treated as one slot.
 func TestClaimCountGuard(t *testing.T) {
 	d := disruptor.NewDisruptor(64, newEvent)
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 	defer d.Stop()

@@ -3,28 +3,26 @@ package test
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ex-delivery/go-disruptor"
 )
 
-// TestNextContextCancel fills the ring with a parked consumer, then checks that
-// a producer blocked in NextContext is released with ctx.Err() when its context
-// is cancelled (the interruptible-claim guarantee that plain Next lacks).
+// TestNextContextCancel: a producer blocked in NextContext on a full ring is
+// released with ctx.Err() when its context is cancelled.
 func TestNextContextCancel(t *testing.T) {
 	const capacity = 4
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
 	proceed := make(chan struct{})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		<-proceed // park so the ring fills and never drains
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		<-proceed
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
-	// Fill every slot; the parked consumer frees nothing, so the next claim blocks.
 	for range capacity {
 		seq := d.Next(1)
 		d.Get(seq).Value = 1
@@ -34,11 +32,10 @@ func TestNextContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := d.NextContext(ctx, 1) // blocks: ring is full
+		_, err := d.NextContext(ctx, 1) // blocks: ring full
 		errCh <- err
 	}()
 
-	// It must still be blocked before we cancel.
 	time.Sleep(20 * time.Millisecond)
 	select {
 	case err := <-errCh:
@@ -53,27 +50,27 @@ func TestNextContextCancel(t *testing.T) {
 			t.Fatalf("NextContext err=%v, want context.Canceled", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("NextContext did not return after cancel (blocked claim was not interruptible)")
+		t.Fatal("NextContext did not return after cancel (blocked claim not interruptible)")
 	}
 
 	close(proceed)
 	d.Stop()
 }
 
-// TestStopContextTimeout wedges a consumer's handler and verifies StopContext
-// returns a deadline error promptly instead of blocking forever — the fix for
-// Stop being hostage to a stuck consumer.
+// TestStopContextTimeout: a wedged handler makes StopContext return a deadline
+// error promptly instead of blocking forever.
 func TestStopContextTimeout(t *testing.T) {
 	d := disruptor.NewDisruptor(8, newEvent)
 
 	block := make(chan struct{})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		<-block // wedged: never returns until the test releases it
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		<-block // wedged
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
-	seq := d.Next(1) // one event so the consumer enters (and wedges in) the handler
+	seq := d.Next(1)
 	d.Get(seq).Value = 1
 	d.Publish(seq, seq)
 
@@ -93,22 +90,20 @@ func TestStopContextTimeout(t *testing.T) {
 	if elapsed > time.Second {
 		t.Fatalf("StopContext blocked %v; should have returned near the 50ms deadline", elapsed)
 	}
-
-	close(block) // release the wedged goroutine so the test doesn't leak it
+	close(block)
 }
 
-// TestStopContextClean verifies the happy path: with a context that never ends,
-// StopContext drains every published event and returns nil.
+// TestStopContextClean: with a context that never ends, StopContext drains every
+// event and returns nil.
 func TestStopContextClean(t *testing.T) {
 	const N = 1000
 	d := disruptor.NewDisruptor(64, newEvent)
 
 	var sum int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sum += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sum += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -128,79 +123,34 @@ func TestStopContextClean(t *testing.T) {
 	}
 }
 
-// TestDefaultPanicHandler checks that WithPanicHandler installs a default that
-// every consumer inherits, so a panicking handler is recovered and the pipeline
-// keeps running. StopContext with a deadline turns a regression (stalled
-// pipeline) into a failure instead of a hang.
-func TestDefaultPanicHandler(t *testing.T) {
-	const N = 100
-	var panics int64
-	d := disruptor.NewDisruptor(64, newEvent,
-		disruptor.WithPanicHandler(func(recovered any, lo, hi int64) {
-			atomic.AddInt64(&panics, 1)
-		}))
+// TestDefaultExceptionHandler verifies the disruptor-wide default ExceptionHandler
+// is inherited by consumers, and a per-consumer handler overrides it.
+func TestDefaultExceptionHandler(t *testing.T) {
+	d := disruptor.NewDisruptor(64, newEvent)
+	def := &countingExceptions{}
+	d.HandleExceptionsWith(def)
 
-	var processed int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			if buf[s&mask].Value == 50 {
-				panic("boom")
-			}
-			atomic.AddInt64(&processed, 1)
-		}
-	})
-	d.RegisterConsumer(c)
-	d.Start()
+	a := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		panic("boom-a") // inherits the default handler
+	}))
 
-	for i := range int64(N) {
-		seq := d.Next(1)
-		d.Get(seq).Value = i
-		d.Publish(seq, seq)
-	}
+	own := &countingExceptions{}
+	b := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		panic("boom-b")
+	})).HandleExceptionsWith(own) // overrides the default
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := d.StopContext(ctx); err != nil {
-		t.Fatalf("pipeline stalled, default panic handler not applied? %v", err)
-	}
-	if panics == 0 {
-		t.Fatal("default panic handler was never invoked")
-	}
-	if processed == 0 || processed >= N {
-		t.Fatalf("processed=%d, expected to skip the poisoned batch but keep going", processed)
-	}
-}
-
-// TestPanicHandlerOverride verifies a consumer's own OnPanic takes precedence
-// over the disruptor-wide default.
-func TestPanicHandlerOverride(t *testing.T) {
-	var defaultHits, ownHits int64
-	d := disruptor.NewDisruptor(32, newEvent,
-		disruptor.WithPanicHandler(func(any, int64, int64) {
-			atomic.AddInt64(&defaultHits, 1)
-		}))
-
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		panic("boom")
-	}).OnPanic(func(any, int64, int64) {
-		atomic.AddInt64(&ownHits, 1)
-	})
-	d.RegisterConsumer(c)
+	d.RegisterConsumer(a, b)
 	d.Start()
 
 	seq := d.Next(1)
 	d.Get(seq).Value = 1
 	d.Publish(seq, seq)
+	d.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := d.StopContext(ctx); err != nil {
-		t.Fatalf("pipeline stalled: %v", err)
+	if def.events.Load() == 0 {
+		t.Fatal("default ExceptionHandler was not applied to consumer A")
 	}
-	if ownHits == 0 {
-		t.Fatal("consumer's own OnPanic was not used")
-	}
-	if defaultHits != 0 {
-		t.Fatalf("default handler fired %d times; OnPanic should have overridden it", defaultHits)
+	if own.events.Load() == 0 {
+		t.Fatal("per-consumer ExceptionHandler override was not used by consumer B")
 	}
 }

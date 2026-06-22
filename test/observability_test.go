@@ -16,9 +16,10 @@ func TestStats(t *testing.T) {
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
 	proceed := make(chan struct{})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
 		<-proceed // park so occupancy and lag are observable deterministically
-	})
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -62,11 +63,14 @@ func TestStatsBackpressure(t *testing.T) {
 	d := disruptor.NewDisruptor(capacity, newEvent)
 
 	proceed := make(chan struct{})
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) { <-proceed })
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		<-proceed
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
-	for range capacity { // exactly fills the ring — no claim has to wait yet
+	for range capacity { // exactly fills the ring — no claim waits yet
 		seq := d.Next(1)
 		d.Get(seq).Value = 1
 		d.Publish(seq, seq)
@@ -75,7 +79,6 @@ func TestStatsBackpressure(t *testing.T) {
 		t.Fatalf("Backpressure=%d before any blocking claim, want 0", bp)
 	}
 
-	// The ring is full: this claim must wait, which is one back-pressure event.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	if _, err := d.NextContext(ctx, 1); err == nil {
@@ -98,7 +101,9 @@ func TestWithMetrics(t *testing.T) {
 			atomic.AddInt64(&samples, 1)
 		}))
 
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -107,8 +112,8 @@ func TestWithMetrics(t *testing.T) {
 		d.Get(seq).Value = i
 		d.Publish(seq, seq)
 	}
-	time.Sleep(30 * time.Millisecond) // let several samples fire
-	d.Stop()                          // waits for the sampler's final snapshot
+	time.Sleep(30 * time.Millisecond)
+	d.Stop() // waits for the sampler's final snapshot
 
 	if got := atomic.LoadInt64(&samples); got == 0 {
 		t.Fatal("WithMetrics sink was never called")

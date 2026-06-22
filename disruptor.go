@@ -19,7 +19,6 @@ type ProducerFunc func(writeIndex *Sequence, barrier *Barrier, capacity int64) P
 type Options struct {
 	producerFunc    ProducerFunc
 	wait            WaitStrategy
-	panicHandler    func(recovered any, lower, upper int64)
 	metricsInterval time.Duration
 	metricsSink     func(Stats)
 }
@@ -34,15 +33,6 @@ func WithProducerFunc(f ProducerFunc) Option {
 // back-pressure (default YieldingWait).
 func WithWaitStrategy(w WaitStrategy) Option {
 	return func(o *Options) { o.wait = w }
-}
-
-// WithPanicHandler installs a default panic handler applied to every consumer
-// built via Disruptor.Consumer; a consumer's own OnPanic overrides it. Strongly
-// recommended for long-running services: with no handler at all, a panicking
-// event handler crashes its consumer goroutine and stalls the whole pipeline.
-// The handler recovers the panicking batch and consumption continues.
-func WithPanicHandler(h func(recovered any, lower, upper int64)) Option {
-	return func(o *Options) { o.panicHandler = h }
 }
 
 // WithMetrics starts a background goroutine that samples Stats every interval and
@@ -80,17 +70,16 @@ type Disruptor[T any] struct {
 	Producer
 	*RingBuffer[T]
 
-	barrier         *Barrier // producer back-pressure gate (sink consumers)
-	wait            WaitStrategy
-	consumers       []*Consumer[T]
-	pools           []*WorkerPool[T]
-	defaultPanic    func(recovered any, lower, upper int64) // applied to each Consumer
-	metricsInterval time.Duration
-	metricsSink     func(Stats)
-	samplerStop     chan struct{}
-	samplerDone     chan struct{}
-	started         atomic.Bool
-	stopped         atomic.Bool
+	barrier           *Barrier // producer back-pressure gate (sink consumers)
+	wait              WaitStrategy
+	consumers         []*Consumer[T]
+	defaultExceptions ExceptionHandler[T] // applied to each Consumer; override via HandleExceptionsWith
+	metricsInterval   time.Duration
+	metricsSink       func(Stats)
+	samplerStop       chan struct{}
+	samplerDone       chan struct{}
+	started           atomic.Bool
+	stopped           atomic.Bool
 }
 
 // NewDisruptor builds a disruptor with a ring of (at least) capacity slots
@@ -113,56 +102,33 @@ func NewDisruptor[T any](capacity int64, factory func() T, opts ...Option) *Disr
 		RingBuffer:      rb,
 		barrier:         gate,
 		wait:            options.wait,
-		defaultPanic:    options.panicHandler,
 		metricsInterval: options.metricsInterval,
 		metricsSink:     options.metricsSink,
 	}
 }
 
-// Consumer creates a consumer bound to this disruptor's ring. Configure it
-// (Depends/OnPanic) and then pass it to RegisterConsumer before Start.
-func (d *Disruptor[T]) Consumer(fn EventHandler[T]) *Consumer[T] {
-	c := NewConsumer(d.RingBuffer, fn)
+// Consumer creates a consumer bound to this disruptor's ring, driven by handler.
+// Configure it (Depends / HandleExceptionsWith / WithRewindStrategy /
+// MaxBatchSize / Timeout) and then pass it to RegisterConsumer before Start.
+func (d *Disruptor[T]) Consumer(handler EventHandler[T]) *Consumer[T] {
+	c := NewConsumer(d.RingBuffer, handler)
 	c.barrier.setStrategy(d.wait)
-	c.onPanic = d.defaultPanic // default; a later OnPanic call overrides it
+	c.exceptions = d.defaultExceptions // default; HandleExceptionsWith overrides
 	return c
+}
+
+// HandleExceptionsWith sets the default ExceptionHandler applied to consumers
+// created afterwards via Consumer; a consumer's own HandleExceptionsWith
+// overrides it. Returns the disruptor for chaining; call before creating
+// consumers.
+func (d *Disruptor[T]) HandleExceptionsWith(h ExceptionHandler[T]) *Disruptor[T] {
+	d.defaultExceptions = h
+	return d
 }
 
 // RegisterConsumer enrolls one or more consumers to be launched at Start.
 func (d *Disruptor[T]) RegisterConsumer(cs ...*Consumer[T]) {
 	d.consumers = append(d.consumers, cs...)
-}
-
-// WorkerPool creates a pool of size worker goroutines that load-balance the
-// stream: each published event is handled by exactly one worker via fn. Gates
-// on the ring writer cursor. Configure it (OnPanic) and pass it to
-// RegisterWorkerPool before Start. size < 1 is treated as 1.
-func (d *Disruptor[T]) WorkerPool(size int, fn WorkHandler[T]) *WorkerPool[T] {
-	if size < 1 {
-		size = 1
-	}
-	p := &WorkerPool[T]{
-		ringBuffer: d.RingBuffer,
-		fn:         fn,
-	}
-	p.barrier.setStrategy(d.wait)
-	p.barrier.Register(d.RingBuffer.WriterIndex())
-	p.workSequence.Store(-1)
-	if d.defaultPanic != nil {
-		dp := d.defaultPanic
-		p.onPanic = func(recovered any, seq int64) { dp(recovered, seq, seq) }
-	}
-	for range size {
-		w := &workProcessor[T]{pool: p, done: make(chan struct{})}
-		w.readIndex.Store(-1)
-		p.workers = append(p.workers, w)
-	}
-	return p
-}
-
-// RegisterWorkerPool enrolls one or more worker pools to be launched at Start.
-func (d *Disruptor[T]) RegisterWorkerPool(pools ...*WorkerPool[T]) {
-	d.pools = append(d.pools, pools...)
 }
 
 // Start launches every registered consumer goroutine and wires producer
@@ -180,18 +146,8 @@ func (d *Disruptor[T]) Start() {
 			d.barrier.Register(&c.readIndex)
 		}
 	}
-	// Worker pools are always sinks: every worker's read cursor gates the
-	// producer so no slot is overwritten while any worker is still on it.
-	for _, p := range d.pools {
-		for _, seq := range p.gatingSequences() {
-			d.barrier.Register(seq)
-		}
-	}
 	for _, c := range d.consumers {
 		go c.run()
-	}
-	for _, p := range d.pools {
-		p.start()
 	}
 	if d.metricsSink != nil && d.metricsInterval > 0 {
 		d.samplerStop = make(chan struct{})

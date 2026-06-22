@@ -32,23 +32,21 @@ func reportPercentiles(b *testing.B, lat []int64) {
 }
 
 // BenchmarkLatencySPSC measures end-to-end latency through the disruptor and
-// reports the distribution (p50/p99/p99.9) rather than just throughput — the
-// metric that matters for an ultra-low-latency pipeline.
+// reports the distribution rather than just throughput.
 //
 // Note: one-way latencies here are often below time.Now()'s effective resolution
-// (and the ~tens-of-ns cost of the call itself), so p50 commonly reports 0 —
-// read that as "delivered faster than the clock can resolve", not zero latency.
-// The tail (p99/p99.9) still captures scheduling and GC jitter, and
-// BenchmarkChannelLatencySPSC gives a same-method baseline to compare against.
+// (and the ~tens-of-ns cost of the call), so p50 commonly reports 0 — read that
+// as "delivered faster than the clock can resolve", not zero latency. The tail
+// (p99/p99.9) still captures scheduling and GC jitter, and
+// BenchmarkChannelLatencySPSC is a same-method baseline.
 func BenchmarkLatencySPSC(b *testing.B) {
 	d := disruptor.NewDisruptor(1024, func() stamped { return stamped{} })
 
 	lat := make([]int64, 0, 1<<16)
-	c := d.Consumer(func(buf []stamped, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			lat = append(lat, time.Now().UnixNano()-buf[s&mask].pub) // per-event, matching the channel bench
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[stamped](func(e *stamped, seq int64, eob bool) error {
+		lat = append(lat, time.Now().UnixNano()-e.pub) // per-event, matching the channel bench
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -62,8 +60,8 @@ func BenchmarkLatencySPSC(b *testing.B) {
 	reportPercentiles(b, lat)
 }
 
-// BenchmarkChannelLatencySPSC is the buffered-channel equivalent, for a like-for-
-// like latency comparison against BenchmarkLatencySPSC.
+// BenchmarkChannelLatencySPSC is the buffered-channel equivalent, for a
+// like-for-like latency comparison against BenchmarkLatencySPSC.
 func BenchmarkChannelLatencySPSC(b *testing.B) {
 	ch := make(chan stamped, 1024)
 	lat := make([]int64, 0, 1<<16)

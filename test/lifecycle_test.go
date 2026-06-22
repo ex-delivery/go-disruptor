@@ -7,72 +7,54 @@ import (
 	"github.com/ex-delivery/go-disruptor"
 )
 
+// lifecycleHandler implements EventHandler plus the optional LifecycleAware
+// interface, mirroring how Disruptor v4 folds onStart/onShutdown into the handler.
+type lifecycleHandler struct {
+	started   atomic.Int64
+	shutdown  atomic.Int64
+	processed atomic.Int64
+	ordering  atomic.Int64 // counts events seen before OnStart (must stay 0)
+}
+
+func (h *lifecycleHandler) OnEvent(e *Event, seq int64, eob bool) error {
+	if h.started.Load() == 0 {
+		h.ordering.Add(1)
+	}
+	h.processed.Add(1)
+	return nil
+}
+
+func (h *lifecycleHandler) OnStart()    { h.started.Add(1) }
+func (h *lifecycleHandler) OnShutdown() { h.shutdown.Add(1) }
+
 // TestConsumerLifecycle verifies OnStart fires once before processing and
-// OnShutdown fires once after draining (and completes before Stop returns).
+// OnShutdown fires once after draining (completing before Stop returns).
 func TestConsumerLifecycle(t *testing.T) {
-	var started, shutdown, ordered atomic.Int64
+	const N = 10
 	d := disruptor.NewDisruptor(64, newEvent)
 
-	var processed int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		// onStart must have run before any event is processed.
-		if started.Load() == 0 {
-			ordered.Store(1) // flag an ordering violation
-		}
-		for s := lo; s <= hi; s++ {
-			processed++
-		}
-	}).
-		OnStart(func() { started.Add(1) }).
-		OnShutdown(func() { shutdown.Add(1) })
+	h := &lifecycleHandler{}
+	c := d.Consumer(h)
 	d.RegisterConsumer(c)
 	d.Start()
 
-	for i := int64(1); i <= 10; i++ {
+	for i := int64(1); i <= N; i++ {
 		seq := d.Next(1)
 		d.Get(seq).Value = i
 		d.Publish(seq, seq)
 	}
 	d.Stop()
 
-	if got := started.Load(); got != 1 {
+	if got := h.started.Load(); got != 1 {
 		t.Fatalf("OnStart called %d times, want 1", got)
 	}
-	if got := shutdown.Load(); got != 1 {
+	if got := h.shutdown.Load(); got != 1 {
 		t.Fatalf("OnShutdown called %d times, want 1 (must complete before Stop returns)", got)
 	}
-	if ordered.Load() != 0 {
-		t.Fatal("an event was processed before OnStart ran")
+	if got := h.ordering.Load(); got != 0 {
+		t.Fatalf("%d events processed before OnStart ran", got)
 	}
-	if processed != 10 {
-		t.Fatalf("processed=%d want 10", processed)
-	}
-}
-
-// TestWorkerPoolLifecycle verifies the pool's OnStart/OnShutdown fire once per
-// worker goroutine.
-func TestWorkerPoolLifecycle(t *testing.T) {
-	const workers = 4
-	var started, shutdown atomic.Int64
-	d := disruptor.NewDisruptor(64, newEvent)
-
-	pool := d.WorkerPool(workers, func(buf []Event, mask, seq int64) {}).
-		OnStart(func() { started.Add(1) }).
-		OnShutdown(func() { shutdown.Add(1) })
-	d.RegisterWorkerPool(pool)
-	d.Start()
-
-	for i := int64(1); i <= 50; i++ {
-		seq := d.Next(1)
-		d.Get(seq).Value = i
-		d.Publish(seq, seq)
-	}
-	d.Stop()
-
-	if got := started.Load(); got != workers {
-		t.Fatalf("OnStart called %d times, want %d (once per worker)", got, workers)
-	}
-	if got := shutdown.Load(); got != workers {
-		t.Fatalf("OnShutdown called %d times, want %d (once per worker)", got, workers)
+	if got := h.processed.Load(); got != N {
+		t.Fatalf("processed=%d want %d", got, N)
 	}
 }

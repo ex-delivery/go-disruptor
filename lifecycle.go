@@ -6,11 +6,11 @@ import (
 )
 
 // StopContext is like Stop but bounded by ctx: it drains published events and
-// shuts every stage (consumers and worker pools) down, yet if ctx is cancelled
-// (or its deadline passes) before a stage has caught up to the last published
-// sequence, it alerts the stages anyway and returns ctx.Err().
+// shuts the consumers down, yet if ctx is cancelled (or its deadline passes)
+// before a consumer has caught up to the last published sequence, it alerts the
+// consumers anyway and returns ctx.Err().
 //
-// A non-nil return means shutdown was NOT clean: at least one stage had not
+// A non-nil return means shutdown was NOT clean: at least one consumer had not
 // finished draining (for example a wedged handler). Because Go cannot force-kill
 // a goroutine, such a goroutine may still be running after StopContext returns —
 // treat a timeout as a serious condition, not a routine path. On a nil error
@@ -36,21 +36,9 @@ func (d *Disruptor[T]) StopContext(ctx context.Context) error {
 			break
 		}
 	}
-	if drained {
-		for _, p := range d.pools {
-			if !drainUntil(ctx, final, p.minSequence) {
-				drained = false
-				break
-			}
-		}
-	}
-
-	// Alert every stage so the goroutines that can exit do.
+	// Alert every consumer so the goroutines that can exit do.
 	for _, c := range d.consumers {
 		c.signalStop()
-	}
-	for _, p := range d.pools {
-		p.signalStop()
 	}
 
 	// Stop the metrics sampler (if any), taking its final snapshot.
@@ -65,9 +53,6 @@ func (d *Disruptor[T]) StopContext(ctx context.Context) error {
 
 	for _, c := range d.consumers {
 		c.waitDone()
-	}
-	for _, p := range d.pools {
-		p.waitDone()
 	}
 	return nil
 }

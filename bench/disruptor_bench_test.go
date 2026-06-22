@@ -10,14 +10,14 @@ import (
 type Event struct{ Value int64 }
 
 func newEvent() Event { return Event{} }
+
 func BenchmarkSPSC(b *testing.B) {
 	d := disruptor.NewDisruptor(1024, newEvent)
 	var sink int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			sink += buf[s&mask].Value
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		sink += e.Value
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 
@@ -34,11 +34,10 @@ func BenchmarkSPSC(b *testing.B) {
 func BenchmarkMPSC(b *testing.B) {
 	d := disruptor.NewDisruptor(1024, newEvent, disruptor.WithProducerFunc(disruptor.NewMultiProducer))
 	var sink int64
-	c := d.Consumer(func(buf []Event, mask, lo, hi int64) {
-		for s := lo; s <= hi; s++ {
-			atomic.AddInt64(&sink, buf[s&mask].Value)
-		}
-	})
+	c := d.Consumer(disruptor.EventHandlerFunc[Event](func(e *Event, seq int64, eob bool) error {
+		atomic.AddInt64(&sink, e.Value)
+		return nil
+	}))
 	d.RegisterConsumer(c)
 	d.Start()
 

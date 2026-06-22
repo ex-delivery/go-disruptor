@@ -5,6 +5,7 @@ import (
 	"math"
 	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 // Barrier aggregates a set of upstream Sequences and exposes their minimum as a
@@ -124,3 +125,33 @@ func (b *Barrier) waitForContext(ctx context.Context, expected int64) (available
 // stallCount reports how many times a waiter on this barrier had to wait. On the
 // producer gate this is the cumulative back-pressure event count.
 func (b *Barrier) stallCount() int64 { return b.stalls.Load() }
+
+// waitForTimeout behaves like WaitFor but also gives up after timeout elapses
+// with no progress, returning (min, false, true). It backs Consumer.Timeout /
+// EventHandler.OnTimeout. timeout must be > 0; for the no-timeout path use
+// WaitFor (this one reads the clock each idle poll).
+//
+// Returns (min, false, false) when data is ready, (min, true, false) when
+// alerted, and (min, false, true) on timeout.
+func (b *Barrier) waitForTimeout(expected int64, timeout time.Duration) (available int64, alerted, timedOut bool) {
+	start := time.Now()
+	spin := 0
+	for {
+		m := b.minimum()
+		if m >= expected {
+			return m, false, false
+		}
+		if b.alerted.Load() {
+			return m, true, false
+		}
+		if time.Since(start) >= timeout {
+			return m, false, true
+		}
+		if b.strategy != nil {
+			b.strategy.Idle(spin)
+		} else {
+			runtime.Gosched()
+		}
+		spin++
+	}
+}
