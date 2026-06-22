@@ -1,0 +1,22 @@
+# Test binaries / build output
+*.test
+*.exe
+*.out
+
+# Coverage
+coverage.txt
+coverage.html
+*.cover
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directory (this module has none, but guard against accidental vendoring)
+/vendor/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*~
