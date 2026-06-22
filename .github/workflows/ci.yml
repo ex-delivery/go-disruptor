@@ -18,6 +18,7 @@ jobs:
         with:
           go-version: '1.26.2'
           check-latest: true
+          cache: false # this module has no dependencies (no go.sum)
 
       - name: gofmt
         run: |
@@ -57,6 +58,11 @@ jobs:
         with:
           go-version: '1.26.2'
           check-latest: true
+          cache: false # this module has no dependencies (no go.sum)
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # Build golangci-lint from source with the CI's Go 1.26.2 so its build
+          # version isn't older than the module's targeted Go (the binary release
+          # lags new Go versions and refuses to run otherwise).
+          install-mode: goinstall
